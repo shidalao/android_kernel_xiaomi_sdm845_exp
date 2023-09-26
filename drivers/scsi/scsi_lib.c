@@ -33,9 +33,11 @@
 #include <scsi/scsi_dh.h>
 
 #include <trace/events/scsi.h>
+#include <trace/events/block.h>
 
 #include "scsi_priv.h"
 #include "scsi_logging.h"
+#include "../../../block/blk.h"
 
 
 struct kmem_cache *scsi_sdb_cache;
@@ -202,7 +204,11 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	req->sense = sense;
 	req->sense_len = 0;
 	req->retries = retries;
-	req->timeout = timeout;
+	if (likely(!sdev->timeout_override))
+		req->timeout = timeout;
+	else
+		req->timeout = sdev->timeout_override;
+
 	req->cmd_flags |= flags | REQ_QUIET | REQ_PREEMPT;
 
 	/*
@@ -1535,6 +1541,8 @@ static void scsi_softirq_done(struct request *rq)
 	unsigned long wait_for = (cmd->allowed + 1) * rq->timeout;
 	int disposition;
 
+	trace_scsi_softirq_done(cmd->tag);
+
 	INIT_LIST_HEAD(&cmd->eh_entry);
 
 	atomic_inc(&cmd->device->iodone_cnt);
@@ -1554,15 +1562,23 @@ static void scsi_softirq_done(struct request *rq)
 
 	switch (disposition) {
 		case SUCCESS:
+			blk_set_bio_status(rq, BIO_SUCCESS);
+			blk_request_set_polling(rq, false);
 			scsi_finish_command(cmd);
 			break;
 		case NEEDS_RETRY:
+			blk_set_bio_status(rq, BIO_NEEDS_RETRY);
+			blk_request_set_polling(rq, false);
 			scsi_queue_insert(cmd, SCSI_MLQUEUE_EH_RETRY);
 			break;
 		case ADD_TO_MLQUEUE:
+			blk_set_bio_status(rq, BIO_ADD_TO_MLQUEUE);
+			blk_request_set_polling(rq, false);
 			scsi_queue_insert(cmd, SCSI_MLQUEUE_DEVICE_BUSY);
 			break;
 		default:
+			blk_set_bio_status(rq, BIO_UNKNOWN);
+			blk_request_set_polling(rq, false);
 			if (!scsi_eh_scmd_add(cmd, 0))
 				scsi_finish_command(cmd);
 	}
@@ -1877,6 +1893,22 @@ static void scsi_mq_done(struct scsi_cmnd *cmd)
 	blk_mq_complete_request(cmd->request, cmd->request->errors);
 }
 
+static int scsi_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag, struct bio *bio) {
+	struct request_queue *q = NULL;
+	struct scsi_device *sdev = NULL;
+	struct Scsi_Host *shost = NULL;
+	if (hctx && hctx->queue)
+		q = hctx->queue;
+	if (q && q->queuedata)
+		sdev = (struct scsi_device *)q->queuedata;
+	if (sdev && sdev->host)
+		shost = sdev->host;
+	if (shost && shost->hostt->poll)
+		return shost->hostt->poll(hctx, tag, bio);
+	else
+		return -EPERM;
+}
+
 static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
 			 const struct blk_mq_queue_data *bd)
 {
@@ -2040,6 +2072,8 @@ static void __scsi_init_queue(struct Scsi_Host *shost, struct request_queue *q)
 	if (!shost->use_clustering)
 		q->limits.cluster = 0;
 
+	if (shost->inlinecrypt_support)
+		queue_flag_set_unlocked(QUEUE_FLAG_INLINECRYPT, q);
 	/*
 	 * Set a reasonable default alignment:  The larger of 32-byte (dword),
 	 * which is a common minimum for HBAs, and the minimum DMA alignment,
@@ -2085,6 +2119,7 @@ static struct blk_mq_ops scsi_mq_ops = {
 	.timeout	= scsi_timeout,
 	.init_request	= scsi_init_request,
 	.exit_request	= scsi_exit_request,
+	.poll		= scsi_poll,
 };
 
 struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
@@ -2200,6 +2235,33 @@ void scsi_unblock_requests(struct Scsi_Host *shost)
 	scsi_run_host_queues(shost);
 }
 EXPORT_SYMBOL(scsi_unblock_requests);
+
+/*
+ * Function:    scsi_set_cmd_timeout_override()
+ *
+ * Purpose:     Utility function used by low-level drivers to override
+		timeout for the scsi commands.
+ *
+ * Arguments:   sdev       - scsi device in question
+ *		timeout	   - timeout in jiffies
+ *
+ * Returns:     Nothing
+ *
+ * Lock status: No locks are assumed held.
+ *
+ * Notes:	Some platforms might be very slow and command completion may
+ *		take much longer than default scsi command timeouts.
+ *		SCSI Read/Write command timeout can be changed by
+ *		blk_queue_rq_timeout() but there is no option to override
+ *		timeout for rest of the scsi commands. This function would
+ *		would allow this.
+ */
+void scsi_set_cmd_timeout_override(struct scsi_device *sdev,
+				   unsigned int timeout)
+{
+	sdev->timeout_override = timeout;
+}
+EXPORT_SYMBOL(scsi_set_cmd_timeout_override);
 
 int __init scsi_init_queue(void)
 {

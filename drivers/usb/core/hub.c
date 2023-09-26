@@ -48,6 +48,11 @@ static void hub_event(struct work_struct *work);
 /* synchronize hub-port add/remove and peering operations */
 DEFINE_MUTEX(usb_port_peer_mutex);
 
+static bool skip_extended_resume_delay = 1;
+module_param(skip_extended_resume_delay, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(skip_extended_resume_delay,
+		"removes extra delay added to finish bus resume");
+
 /* cycle leds on hubs that aren't blinking for attention */
 static bool blinkenlights;
 module_param(blinkenlights, bool, S_IRUGO);
@@ -102,6 +107,10 @@ EXPORT_SYMBOL_GPL(ehci_cf_port_reset_rwsem);
 static void hub_release(struct kref *kref);
 static int usb_reset_and_verify_device(struct usb_device *udev);
 static int hub_port_disable(struct usb_hub *hub, int port1, int set_state);
+
+unsigned int connected_usb_idVendor;
+unsigned int connected_usb_idProduct;
+unsigned int connected_usb_devnum = 0xff;
 
 static inline char *portspeed(struct usb_hub *hub, int portstatus)
 {
@@ -635,6 +644,12 @@ void usb_kick_hub_wq(struct usb_device *hdev)
 	if (hub)
 		kick_hub_wq(hub);
 }
+
+void usb_flush_hub_wq(void)
+{
+	flush_workqueue(hub_wq);
+}
+EXPORT_SYMBOL(usb_flush_hub_wq);
 
 /*
  * Let the USB core know that a USB 3.0 device has sent a Function Wake Device
@@ -2119,6 +2134,14 @@ void usb_disconnect(struct usb_device **pdev)
 	dev_info(&udev->dev, "USB disconnect, device number %d\n",
 			udev->devnum);
 
+	if (connected_usb_devnum == udev->devnum)
+	{
+		dev_info(&udev->dev, "xiaomi headset removed, devnum %d\n", udev->devnum);
+		connected_usb_idVendor = 0;
+		connected_usb_idProduct = 0;
+		connected_usb_devnum = 0xff;
+	}
+
 	/*
 	 * Ensure that the pm runtime code knows that the USB device
 	 * is in the process of being disconnected.
@@ -2445,6 +2468,15 @@ int usb_new_device(struct usb_device *udev)
 	/* export the usbdev device-node for libusb */
 	udev->dev.devt = MKDEV(USB_DEVICE_MAJOR,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));
+
+	if ((0x2717 == le16_to_cpu(udev->descriptor.idVendor))
+			&&(0x3801 == le16_to_cpu(udev->descriptor.idProduct)))
+	{
+		connected_usb_idVendor = le16_to_cpu(udev->descriptor.idVendor);
+		connected_usb_idProduct = le16_to_cpu(udev->descriptor.idProduct);
+		connected_usb_devnum = udev->devnum;
+		dev_info(&udev->dev, "xiaomi headset identified, devnum %d\n", udev->devnum);
+	}
 
 	/* Tell the world! */
 	announce_device(udev);
@@ -3458,7 +3490,9 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		/* drive resume for USB_RESUME_TIMEOUT msec */
 		dev_dbg(&udev->dev, "usb %sresume\n",
 				(PMSG_IS_AUTO(msg) ? "auto-" : ""));
-		msleep(USB_RESUME_TIMEOUT);
+		if (!skip_extended_resume_delay)
+			usleep_range(USB_RESUME_TIMEOUT * 1000,
+					(USB_RESUME_TIMEOUT + 1) * 1000);
 
 		/* Virtual root hubs can trigger on GET_PORT_STATUS to
 		 * stop resume signaling.  Then finish the resume
@@ -3467,7 +3501,7 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		status = hub_port_status(hub, port1, &portstatus, &portchange);
 
 		/* TRSMRCY = 10 msec */
-		msleep(10);
+		usleep_range(10000, 10500);
 	}
 
  SuspendCleared:
@@ -4670,7 +4704,8 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 	/* notify HCD that we have a device connected and addressed */
 	if (hcd->driver->update_device)
 		hcd->driver->update_device(hcd, udev);
-	hub_set_initial_usb2_lpm_policy(udev);
+	if (0) /*disable USB 2.0 Link PM to fix long time usb storage recognition issue*/
+		hub_set_initial_usb2_lpm_policy(udev);
 fail:
 	if (retval) {
 		hub_port_disable(hub, port1, 0);
@@ -4758,7 +4793,7 @@ hub_power_remaining(struct usb_hub *hub)
 static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 		u16 portchange)
 {
-	int status = -ENODEV;
+	int ret, status = -ENODEV;
 	int i;
 	unsigned unit_load;
 	struct usb_device *hdev = hub->hdev;
@@ -4766,6 +4801,7 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 	struct usb_port *port_dev = hub->ports[port1 - 1];
 	struct usb_device *udev = port_dev->child;
 	static int unreliable_port = -1;
+	enum usb_device_speed dev_speed = USB_SPEED_UNKNOWN;
 
 	/* Disconnect any existing devices under this port */
 	if (udev) {
@@ -4820,6 +4856,7 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 	else
 		unit_load = 100;
 
+retry_enum:
 	status = 0;
 	for (i = 0; i < SET_CONFIG_TRIES; i++) {
 
@@ -4856,6 +4893,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 		usb_unlock_port(port_dev);
 		if (status < 0)
 			goto loop;
+
+		dev_speed = udev->speed;
+		if (udev->speed > USB_SPEED_UNKNOWN &&
+				udev->speed <= USB_SPEED_HIGH && hcd->usb_phy
+				&& hcd->usb_phy->disable_chirp)
+			hcd->usb_phy->disable_chirp(hcd->usb_phy,
+					false);
 
 		if (udev->quirks & USB_QUIRK_DELAY_INIT)
 			msleep(2000);
@@ -4968,6 +5012,19 @@ loop:
 		if (status != -ENOTCONN && status != -ENODEV)
 			dev_err(&port_dev->dev,
 					"unable to enumerate USB device\n");
+		if (!hub->hdev->parent && dev_speed == USB_SPEED_UNKNOWN
+			&& hcd->usb_phy && hcd->usb_phy->disable_chirp) {
+			ret = hcd->usb_phy->disable_chirp(hcd->usb_phy, true);
+			if (!ret) {
+				dev_dbg(&port_dev->dev,
+					"chirp disabled re-try enum\n");
+				goto retry_enum;
+			} else {
+				/* bail out and re-enable chirping */
+				hcd->usb_phy->disable_chirp(hcd->usb_phy,
+						false);
+			}
+		}
 	}
 
 done:

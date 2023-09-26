@@ -2,6 +2,7 @@
  * fs/direct-io.c
  *
  * Copyright (C) 2002, Linus Torvalds.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * O_DIRECT
  *
@@ -37,6 +38,8 @@
 #include <linux/uio.h>
 #include <linux/atomic.h>
 #include <linux/prefetch.h>
+#define __FS_HAS_ENCRYPTION IS_ENABLED(CONFIG_F2FS_FS_ENCRYPTION)
+#include <linux/fscrypt.h>
 
 /*
  * How many user pages to map in one call to get_user_pages().  This determines
@@ -127,6 +130,7 @@ struct dio {
 	int io_error;			/* IO error in completion path */
 	unsigned long refcount;		/* direct_io_worker() and bios */
 	struct bio *bio_list;		/* singly linked via bi_private */
+	struct bio *bio;
 	struct task_struct *waiter;	/* waiting task (NULL if none) */
 
 	/* AIO related stuff */
@@ -390,6 +394,23 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
 }
 
+#ifdef CONFIG_PFK
+static bool is_inode_filesystem_type(const struct inode *inode,
+					const char *fs_type)
+{
+	if (!inode || !fs_type)
+		return false;
+
+	if (!inode->i_sb)
+		return false;
+
+	if (!inode->i_sb->s_type)
+		return false;
+
+	return (strcmp(inode->i_sb->s_type->name, fs_type) == 0);
+}
+#endif
+
 /*
  * In the AIO read case we speculatively dirty the pages before starting IO.
  * During IO completion, any of these pages which happen to have been written
@@ -411,19 +432,46 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 	if (dio->is_async && dio->op == REQ_OP_READ && dio->should_dirty)
 		bio_set_pages_dirty(bio);
 
+#ifdef CONFIG_PFK
+	bio->bi_dio_inode = dio->inode;
+
+/* iv sector for security/pfe/pfk_fscrypt.c and f2fs in fs/f2fs/f2fs.h.*/
+#define PG_DUN_NEW(i,p)                                            \
+	(((((u64)(i)->i_ino) & 0xffffffff) << 32) | ((p) & 0xffffffff))
+
+	if (is_inode_filesystem_type(dio->inode, "f2fs"))
+		fscrypt_set_ice_dun(dio->inode, bio, PG_DUN_NEW(dio->inode,
+			(sdio->logical_offset_in_bio >> PAGE_SHIFT)));
+#endif
 	dio->bio_bdev = bio->bi_bdev;
 
 	if (sdio->submit_io) {
 		sdio->submit_io(bio, dio->inode, sdio->logical_offset_in_bio);
 		dio->bio_cookie = BLK_QC_T_NONE;
-	} else
+	} else {
+		dio->bio = bio;
 		dio->bio_cookie = submit_bio(bio);
+	}
 
 	sdio->bio = NULL;
 	sdio->boundary = 0;
 	sdio->logical_offset_in_bio = 0;
 }
 
+struct inode *dio_bio_get_inode(struct bio *bio)
+{
+	struct inode *inode = NULL;
+
+	if (bio == NULL)
+		return NULL;
+
+#ifdef CONFIG_PFK
+	inode = bio->bi_dio_inode;
+#endif
+
+	return inode;
+}
+EXPORT_SYMBOL(dio_bio_get_inode);
 /*
  * Release any resources in case of a failure
  */
@@ -443,6 +491,7 @@ static struct bio *dio_await_one(struct dio *dio)
 {
 	unsigned long flags;
 	struct bio *bio = NULL;
+	struct bio *polling_bio = NULL;
 
 	spin_lock_irqsave(&dio->bio_lock, flags);
 
@@ -455,10 +504,16 @@ static struct bio *dio_await_one(struct dio *dio)
 	while (dio->refcount > 1 && dio->bio_list == NULL) {
 		__set_current_state(TASK_UNINTERRUPTIBLE);
 		dio->waiter = current;
+		if (dio->bio) {
+			polling_bio = dio->bio;
+			bio_get(polling_bio);
+		}
 		spin_unlock_irqrestore(&dio->bio_lock, flags);
-		if (!(dio->iocb->ki_flags & IOCB_HIPRI) ||
-		    !blk_poll(bdev_get_queue(dio->bio_bdev), dio->bio_cookie))
+		if (!blk_poll(bdev_get_queue(dio->bio_bdev), dio->bio_cookie, polling_bio)) {
 			io_schedule();
+		}
+		if (polling_bio)
+			bio_put(polling_bio);
 		/* wake up sets us TASK_RUNNING */
 		spin_lock_irqsave(&dio->bio_lock, flags);
 		dio->waiter = NULL;
@@ -479,6 +534,7 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 	struct bio_vec *bvec;
 	unsigned i;
 	int err;
+	unsigned long flags;
 
 	if (bio->bi_error)
 		dio->io_error = -EIO;
@@ -496,7 +552,14 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 			put_page(page);
 		}
 		err = bio->bi_error;
-		bio_put(bio);
+		if (dio->bio == bio) {
+			spin_lock_irqsave(&dio->bio_lock, flags);
+			dio->bio = NULL;
+			bio_put(bio);
+			spin_unlock_irqrestore(&dio->bio_lock, flags);
+		} else {
+			bio_put(bio);
+		}
 	}
 	return err;
 }
